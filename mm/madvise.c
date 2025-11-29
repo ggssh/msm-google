@@ -24,6 +24,9 @@
 #include <linux/swapops.h>
 #include <linux/shmem_fs.h>
 #include <linux/mmu_notifier.h>
+#include <linux/mm_stat.h>
+#include <linux/types.h>
+#include <linux/timekeeping.h>
 
 #include <asm/tlb.h>
 
@@ -307,7 +310,7 @@ static long madvise_willneed(struct vm_area_struct *vma,
 	return 0;
 }
 
-static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+static int __maybe_unused madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 				unsigned long end, struct mm_walk *walk)
 
 {
@@ -440,7 +443,231 @@ next:
 	return 0;
 }
 
-static void madvise_free_page_range(struct mmu_gather *tlb,
+static int __maybe_unused madvise_free_pte_range_profiling(pmd_t *pmd, unsigned long addr,
+				unsigned long end, struct mm_walk *walk)
+
+{
+	struct mmu_gather *tlb = walk->private;
+	struct mm_struct *mm = tlb->mm;
+	struct vm_area_struct *vma = walk->vma;
+	spinlock_t *ptl;
+	pte_t *orig_pte, *pte, ptent;
+	struct page *page;
+	int nr_swap = 0;
+	unsigned long next;
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	uint64_t *madv_breakdown = walk->madv_breakdown;
+	uint64_t ts_stt = 0;
+	uint64_t ts_walk_pmd_stt = ktime_get_ns();
+	uint64_t ts_walk_ptes_stt = 0;
+	uint64_t ts_pte_not_p = 0, ts_page_lock = 0, ts_make_pte = 0, ts_lru = 0;
+#endif
+
+	next = pmd_addr_end(addr, end);
+	if (pmd_trans_huge(*pmd))
+		if (madvise_free_huge_pmd(tlb, vma, pmd, addr, next))
+			goto next;
+
+	if (pmd_trans_unstable(pmd)) {
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		// yizhe: ADC_MADV_FREE_WALK_PMD Begin
+		adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_WALK_PMD, ktime_get_ns() - ts_walk_pmd_stt);
+		// yizhe: ADC_MADV_FREE_WALK_PMD End
+#endif
+		return 0;
+	}
+
+	tlb_remove_check_page_size_change(tlb, PAGE_SIZE);
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_PTE_LOCK Start
+	ts_stt = ktime_get_ns();
+	orig_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_PTE_LOCK, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_PTE_LOCK End
+#else
+	orig_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+#endif
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB_PEND Start
+	ts_stt = ktime_get_ns();
+	flush_tlb_batched_pending(mm);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_FLUSH_TLB_PEND, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB_PEND End
+#else
+	flush_tlb_batched_pending(mm);
+#endif
+	arch_enter_lazy_mmu_mode();
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	ts_walk_ptes_stt = ktime_get_ns();
+#endif
+	for (; addr != end; pte++, addr += PAGE_SIZE) {
+		ptent = *pte;
+
+		if (pte_none(ptent))
+			continue;
+		/*
+		 * If the pte has swp_entry, just clear page table to
+		 * prevent swap-in which is more expensive rather than
+		 * (page allocation + zeroing).
+		 */
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		// yizhe: ADC_MADV_FREE_PTE_NOT_P Begin
+		ts_stt = ktime_get_ns();
+#endif
+		if (!pte_present(ptent)) {
+			swp_entry_t entry;
+
+			entry = pte_to_swp_entry(ptent);
+			if (non_swap_entry(entry))
+				continue;
+			nr_swap--;
+			free_swap_and_cache(entry);
+			pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+			ts_pte_not_p += ktime_get_ns() - ts_stt;
+#endif
+			continue;
+		}
+
+		page = _vm_normal_page(vma, addr, ptent, true);
+		if (!page)
+			continue;
+
+		/*
+		 * If pmd isn't transhuge but the page is THP and
+		 * is owned by only this process, split it and
+		 * deactivate all pages.
+		 */
+		if (PageTransCompound(page)) {
+			if (page_mapcount(page) != 1)
+				goto out;
+			get_page(page);
+			if (!trylock_page(page)) {
+				put_page(page);
+				goto out;
+			}
+			pte_unmap_unlock(orig_pte, ptl);
+			if (split_huge_page(page)) {
+				unlock_page(page);
+				put_page(page);
+				pte_offset_map_lock(mm, pmd, addr, &ptl);
+				goto out;
+			}
+			unlock_page(page);
+			put_page(page);
+			pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+			pte--;
+			addr -= PAGE_SIZE;
+			continue;
+		}
+
+		VM_BUG_ON_PAGE(PageTransCompound(page), page);
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		ts_stt = ktime_get_ns();
+#endif
+		if (PageSwapCache(page) || PageDirty(page)) {
+			if (!trylock_page(page)) {
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+				ts_page_lock += ktime_get_ns() - ts_stt;
+#endif
+				continue;
+			}
+			/*
+			 * If page is shared with others, we couldn't clear
+			 * PG_dirty of the page.
+			 */
+			if (page_mapcount(page) != 1) {
+				unlock_page(page);
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+				ts_page_lock += ktime_get_ns() - ts_stt;
+#endif
+				continue;
+			}
+
+			if (PageSwapCache(page) && !try_to_free_swap(page)) {
+				unlock_page(page);
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+				ts_page_lock += ktime_get_ns() - ts_stt;
+#endif
+				continue;
+			}
+
+			ClearPageDirty(page);
+			unlock_page(page);
+		}
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		ts_page_lock += ktime_get_ns() - ts_stt;
+		ts_stt = ktime_get_ns();
+#endif
+
+		if (pte_young(ptent) || pte_dirty(ptent)) {
+			/*
+			 * Some of architecture(ex, PPC) don't update TLB
+			 * with set_pte_at and tlb_remove_tlb_entry so for
+			 * the portability, remap the pte with old|clean
+			 * after pte clearing.
+			 */
+			ptent = ptep_get_and_clear_full(mm, addr, pte,
+							tlb->fullmm);
+
+			ptent = pte_mkold(ptent);
+			ptent = pte_mkclean(ptent);
+			set_pte_at(mm, addr, pte, ptent);
+			tlb_remove_tlb_entry(tlb, pte, addr);
+		}
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		ts_make_pte += ktime_get_ns() - ts_stt;
+		ts_stt = ktime_get_ns();
+		mark_page_lazyfree_profiling(page, madv_breakdown);
+		ts_lru += ktime_get_ns() - ts_stt;
+#else
+		mark_page_lazyfree(page);
+#endif
+	}
+out:
+	if (nr_swap) {
+		if (current->mm == mm)
+			sync_mm_rss(mm);
+
+		add_mm_counter(mm, MM_SWAPENTS, nr_swap);
+	}
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_WALK_PTEs, ktime_get_ns() - ts_walk_ptes_stt);
+#endif
+	arch_leave_lazy_mmu_mode();
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_PTE_LOCK Start
+	ts_stt = ktime_get_ns();
+	pte_unmap_unlock(orig_pte, ptl);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_PTE_LOCK, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_PTE_LOCK End
+#else
+	pte_unmap_unlock(orig_pte, ptl);
+#endif
+	cond_resched();
+next:
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_PTE_NOT_P,
+					ts_pte_not_p);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_PAGE_LOCK,
+					ts_page_lock);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_MAKE_PTE,
+					ts_make_pte);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_LRU,
+					ts_lru);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_WALK_PMD,
+					ktime_get_ns() - ts_walk_pmd_stt);
+#endif
+	return 0;
+}
+
+static void __maybe_unused madvise_free_page_range(struct mmu_gather *tlb,
 			     struct vm_area_struct *vma,
 			     unsigned long addr, unsigned long end)
 {
@@ -455,7 +682,55 @@ static void madvise_free_page_range(struct mmu_gather *tlb,
 	tlb_end_vma(tlb, vma);
 }
 
-static int madvise_free_single_vma(struct vm_area_struct *vma,
+static void __maybe_unused madvise_free_page_range_profiling(struct mmu_gather *tlb,
+			     struct vm_area_struct *vma,
+			     unsigned long addr, unsigned long end, uint64_t madv_breakdown[])
+{
+	struct mm_walk free_walk = {
+		.pmd_entry = madvise_free_pte_range_profiling,
+		.mm = vma->vm_mm,
+		.private = tlb,
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		.madv_breakdown = madv_breakdown,
+#endif
+	};
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	uint64_t ts_stt = 0;
+#endif
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB Begin
+	ts_stt = ktime_get_ns();
+	tlb_start_vma(tlb, vma);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_FLUSH_TLB, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB End
+#else
+	tlb_start_vma(tlb, vma);
+#endif
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_WALK_RANGE Start
+	ts_stt = ktime_get_ns();
+	walk_page_range(addr, end, &free_walk);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_WALK_RANGE, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_WALK_RANGE End
+#else
+	walk_page_range(addr, end, &free_walk);
+#endif
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB Start
+	ts_stt = ktime_get_ns();
+	tlb_end_vma(tlb, vma);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_FLUSH_TLB, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB End
+#else
+	tlb_end_vma(tlb, vma);
+#endif
+}
+
+static int __maybe_unused madvise_free_single_vma(struct vm_area_struct *vma,
 			unsigned long start_addr, unsigned long end_addr)
 {
 	unsigned long start, end;
@@ -485,6 +760,59 @@ static int madvise_free_single_vma(struct vm_area_struct *vma,
 	return 0;
 }
 
+static int __maybe_unused madvise_free_single_vma_profiling(struct vm_area_struct *vma,
+			unsigned long start_addr, unsigned long end_addr, uint64_t madv_breakdown[])
+{
+	unsigned long start, end;
+	struct mm_struct *mm = vma->vm_mm;
+	struct mmu_gather tlb;
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	uint64_t ts_stt = 0;
+#endif
+	/* MADV_FREE works for only anon vma at the moment */
+	if (!vma_is_anonymous(vma))
+		return -EINVAL;
+
+	start = max(vma->vm_start, start_addr);
+	if (start >= vma->vm_end)
+		return -EINVAL;
+	end = min(vma->vm_end, end_addr);
+	if (end <= vma->vm_start)
+		return -EINVAL;
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_LRU_DRAIN Begin
+	ts_stt = ktime_get_ns();
+	lru_add_drain();
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_LRU_DRAIN, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_LRU_DRAIN End
+#else
+	lru_add_drain();
+#endif
+	tlb_gather_mmu(&tlb, mm, start, end);
+	update_hiwater_rss(mm);
+
+	mmu_notifier_invalidate_range_start(mm, start, end);
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	madvise_free_page_range_profiling(&tlb, vma, start, end, madv_breakdown);
+#else
+	madvise_free_page_range(&tlb, vma, start, end);
+#endif
+	mmu_notifier_invalidate_range_end(mm, start, end);
+	
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB Start
+	ts_stt = ktime_get_ns();
+	tlb_finish_mmu(&tlb, start, end);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_FLUSH_TLB, ktime_get_ns() - ts_stt);
+	// yizhe: ADC_MADV_FREE_FLUSH_TLB End
+#else
+	tlb_finish_mmu(&tlb, start, end);
+#endif
+	return 0;
+}
+
 /*
  * Application no longer needs these pages.  If the pages are dirty,
  * it's OK to just throw them away.  The app will be more careful about
@@ -511,7 +839,7 @@ static long madvise_dontneed_single_vma(struct vm_area_struct *vma,
 	return 0;
 }
 
-static long madvise_dontneed_free(struct vm_area_struct *vma,
+static long __maybe_unused madvise_dontneed_free(struct vm_area_struct *vma,
 				  struct vm_area_struct **prev,
 				  unsigned long start, unsigned long end,
 				  int behavior)
@@ -563,6 +891,74 @@ static long madvise_dontneed_free(struct vm_area_struct *vma,
 		return madvise_dontneed_single_vma(vma, start, end);
 	else if (behavior == MADV_FREE)
 		return madvise_free_single_vma(vma, start, end);
+	else
+		return -EINVAL;
+}
+
+static long __maybe_unused madvise_dontneed_free_profiling(struct vm_area_struct *vma,
+				  struct vm_area_struct **prev,
+				  unsigned long start, unsigned long end,
+				  int behavior, uint64_t madv_breakdown[])
+{
+	*prev = vma;
+	if (!can_madv_dontneed_vma(vma))
+		return -EINVAL;
+
+	if (!userfaultfd_remove(vma, start, end)) {
+		*prev = NULL; /* mmap_sem has been dropped, prev is stale */
+
+		down_read(&current->mm->mmap_sem);
+		vma = find_vma(current->mm, start);
+		if (!vma)
+			return -ENOMEM;
+		if (start < vma->vm_start) {
+			/*
+			 * This "vma" under revalidation is the one
+			 * with the lowest vma->vm_start where start
+			 * is also < vma->vm_end. If start <
+			 * vma->vm_start it means an hole materialized
+			 * in the user address space within the
+			 * virtual range passed to MADV_DONTNEED
+			 * or MADV_FREE.
+			 */
+			return -ENOMEM;
+		}
+		if (!can_madv_dontneed_vma(vma))
+			return -EINVAL;
+		if (end > vma->vm_end) {
+			/*
+			 * Don't fail if end > vma->vm_end. If the old
+			 * vma was splitted while the mmap_sem was
+			 * released the effect of the concurrent
+			 * operation may not cause madvise() to
+			 * have an undefined result. There may be an
+			 * adjacent next vma that we'll walk
+			 * next. userfaultfd_remove() will generate an
+			 * UFFD_EVENT_REMOVE repetition on the
+			 * end-vma->vm_end range, but the manager can
+			 * handle a repetition fine.
+			 */
+			end = vma->vm_end;
+		}
+		VM_WARN_ON(start >= end);
+	}
+
+	if (behavior == MADV_DONTNEED)
+		return madvise_dontneed_single_vma(vma, start, end);
+	else if (behavior == MADV_FREE){
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		long ret = 0;
+		uint64_t ts_stt = 0;
+		// yizhe: ADC_MADV_FREE_SINGLE_VMA Begin
+		ts_stt = ktime_get_ns();
+		ret = madvise_free_single_vma_profiling(vma, start, end, madv_breakdown);
+		adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_SINGLE_VMA, ktime_get_ns() - ts_stt);
+		// yizhe: ADC_MADV_FREE_SINGLE_VMA End
+		return ret;
+#else
+		return madvise_free_single_vma(vma, start, end);
+#endif
+	}
 	else
 		return -EINVAL;
 }
@@ -674,7 +1070,7 @@ static int madvise_inject_error(int behavior,
 }
 #endif
 
-static long
+static long __maybe_unused
 madvise_vma(struct vm_area_struct *vma, struct vm_area_struct **prev,
 		unsigned long start, unsigned long end, int behavior)
 {
@@ -686,6 +1082,27 @@ madvise_vma(struct vm_area_struct *vma, struct vm_area_struct **prev,
 	case MADV_FREE:
 	case MADV_DONTNEED:
 		return madvise_dontneed_free(vma, prev, start, end, behavior);
+	default:
+		return madvise_behavior(vma, prev, start, end, behavior);
+	}
+}
+
+static long __maybe_unused
+madvise_vma_profiling(struct vm_area_struct *vma, struct vm_area_struct **prev,
+		unsigned long start, unsigned long end, int behavior, uint64_t madv_breakdown[])
+{
+	switch (behavior) {
+	case MADV_REMOVE:
+		return madvise_remove(vma, prev, start, end);
+	case MADV_WILLNEED:
+		return madvise_willneed(vma, prev, start, end);
+	case MADV_FREE:
+	case MADV_DONTNEED:
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		return madvise_dontneed_free_profiling(vma, prev, start, end, behavior, madv_breakdown);
+#else
+		return madvise_dontneed_free(vma, prev, start, end, behavior);
+#endif
 	default:
 		return madvise_behavior(vma, prev, start, end, behavior);
 	}
@@ -798,6 +1215,17 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 	size_t len;
 	struct blk_plug plug;
 
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	uint64_t madv_breakdown[NUM_ADC_MADV_BREAKDOWN_TYPE] = {0};
+#endif
+	
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_TOTAL Begin
+	uint64_t ts_stt = ktime_get_ns();
+	if (behavior == MADV_FREE) {
+		adc_madv_breakdown_stt(madv_breakdown, ADC_MADV_FREE_TOTAL, ts_stt);
+	}
+#endif
 	start = untagged_addr(start);
 
 	if (!madvise_behavior_valid(behavior))
@@ -823,7 +1251,13 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 	if (behavior == MADV_HWPOISON || behavior == MADV_SOFT_OFFLINE)
 		return madvise_inject_error(behavior, start, start + len_in);
 #endif
-
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_MMAP_LOCK Begin
+	if (behavior == MADV_FREE) {
+		uint64_t ts_stt = ktime_get_ns();
+		adc_madv_breakdown_stt(madv_breakdown, ADC_MADV_FREE_MMAP_LOCK, ts_stt);
+	}
+#endif
 	write = madvise_need_mmap_write(behavior);
 	if (write) {
 		if (down_write_killable(&current->mm->mmap_sem))
@@ -831,6 +1265,13 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 	} else {
 		down_read(&current->mm->mmap_sem);
 	}
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	if (behavior == MADV_FREE) {
+		uint64_t ts_edt = ktime_get_ns();
+		adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_MMAP_LOCK, ts_edt);
+	}
+	// yizhe: ADC_MADV_FREE_MMAP_LOCK End
+#endif
 
 	/*
 	 * If the interval [start,end) covers some unmapped address
@@ -862,7 +1303,11 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 			tmp = end;
 
 		/* Here vma->vm_start <= start < tmp <= (end|vma->vm_end). */
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+		error = madvise_vma_profiling(vma, &prev, start, tmp, behavior, madv_breakdown);
+#else
 		error = madvise_vma(vma, &prev, start, tmp, behavior);
+#endif
 		if (error)
 			goto out;
 		start = tmp;
@@ -878,10 +1323,48 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 	}
 out:
 	blk_finish_plug(&plug);
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	// yizhe: ADC_MADV_FREE_MMAP_LOCK Begin
+	if (behavior == MADV_FREE) {
+		uint64_t ts_stt = ktime_get_ns();
+		adc_madv_breakdown_stt(madv_breakdown, ADC_MADV_FREE_MMAP_LOCK, ts_stt);
+	}
+#endif
 	if (write)
 		up_write(&current->mm->mmap_sem);
 	else
 		up_read(&current->mm->mmap_sem);
 
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	if (behavior == MADV_FREE) {
+		uint64_t ts_edt = ktime_get_ns();
+		adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_MMAP_LOCK, ts_edt);
+	}
+	// yizhe: ADC_MADV_FREE_MMAP_LOCK End
+	
+	if (behavior == MADV_FREE) {
+		uint64_t ts_edt = ktime_get_ns();
+		adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_TOTAL, ts_edt);
+		// yizhe: ADC_MADV_FREE_TOTAL End
+
+// #ifdef PROFILE_MADV_FREE_BREAKDOWN
+		printk(KERN_INFO "YYZ : MADV_FREE [TOTAL]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_TOTAL]);
+		printk(KERN_INFO "YYZ : MADV_FREE [SINGLE_VMA]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_SINGLE_VMA]);
+		printk(KERN_INFO "YYZ : MADV_FREE [LRU]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_LRU]);
+		printk(KERN_INFO "YYZ : MADV_FREE [LRU_DRAIN]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_LRU_DRAIN]);
+		printk(KERN_INFO "YYZ : MADV_FREE [FLUSH_TLB]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_FLUSH_TLB]);
+		printk(KERN_INFO "YYZ : MADV_FREE [FLUSH_TLB_PEND]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_FLUSH_TLB_PEND]);
+		printk(KERN_INFO "YYZ : MADV_FREE [WALK_RANGE]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_RANGE]);
+		printk(KERN_INFO "YYZ : MADV_FREE [WALK_PMD]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_PMD]);
+		printk(KERN_INFO "YYZ : MADV_FREE [WALK_PTEs]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_PTEs]);
+		printk(KERN_INFO "YYZ : MADV_FREE [PTE_NOT_P]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PTE_NOT_P]);
+		printk(KERN_INFO "YYZ : MADV_FREE [MAKE_PTE]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_MAKE_PTE]);
+		printk(KERN_INFO "YYZ : MADV_FREE [MMAP_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_MMAP_LOCK]);
+		printk(KERN_INFO "YYZ : MADV_FREE [PTE_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PTE_LOCK]);
+		printk(KERN_INFO "YYZ : MADV_FREE [PAGE_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PAGE_LOCK]);
+// #endif /* PROFILE_MADV_FREE_BREAKDOWN */
+	}
+#endif
 	return error;
 }

@@ -703,7 +703,20 @@ void deactivate_page(struct page *page)
  * mark_page_lazyfree() moves @page to the inactive file list.
  * This is done to accelerate the reclaim of @page.
  */
-void mark_page_lazyfree(struct page *page)
+void __maybe_unused mark_page_lazyfree(struct page *page)
+{
+	if (PageLRU(page) && PageAnon(page) && PageSwapBacked(page) &&
+	    !PageSwapCache(page) && !PageUnevictable(page)) {
+		struct pagevec *pvec = &get_cpu_var(lru_lazyfree_pvecs);
+
+		get_page(page);
+		if (!pagevec_add(pvec, page) || PageCompound(page))
+			pagevec_lru_move_fn(pvec, lru_lazyfree_fn, NULL);
+		put_cpu_var(lru_lazyfree_pvecs);
+	}
+}
+
+void __maybe_unused mark_page_lazyfree_profiling(struct page *page, uint64_t *madv_breakdown)
 {
 	if (PageLRU(page) && PageAnon(page) && PageSwapBacked(page) &&
 	    !PageSwapCache(page) && !PageUnevictable(page)) {

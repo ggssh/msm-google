@@ -334,6 +334,7 @@ extern void rotate_reclaimable_page(struct page *page);
 extern void deactivate_file_page(struct page *page);
 extern void deactivate_page(struct page *page);
 extern void mark_page_lazyfree(struct page *page);
+extern void mark_page_lazyfree_profiling(struct page *page, uint64_t *madv_breakdown);
 extern void swap_setup(void);
 
 extern void add_page_to_unevictable_list(struct page *page);

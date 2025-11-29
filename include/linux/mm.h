@@ -2,6 +2,7 @@
 #ifndef _LINUX_MM_H
 #define _LINUX_MM_H
 
+#include "linux/types.h"
 #include <linux/errno.h>
 
 #ifdef __KERNEL__
@@ -1356,6 +1357,9 @@ struct mm_walk {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
 	void *private;
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	uint64_t *madv_breakdown;
+#endif
 };
 
 int walk_page_range(unsigned long addr, unsigned long end,
