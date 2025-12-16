@@ -59,6 +59,8 @@
 
 #include "internal.h"
 
+#include "linux/mm_stat.h"
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
 
@@ -987,6 +989,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		int may_enter_fs;
 		enum page_references references = PAGEREF_RECLAIM;
 		bool dirty, writeback;
+		enum jvm_heap_flag in_jvm_heap_flag = OUT_JVM_HEAP;
 
 		cond_resched();
 
@@ -1190,7 +1193,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			if (unlikely(PageTransHuge(page)))
 				flags |= TTU_SPLIT_HUGE_PMD;
 
-			if (!try_to_unmap(page, flags)) {
+			if (!try_to_unmap_profiling(page, flags, &in_jvm_heap_flag)) {
 				nr_unmap_fail++;
 				if (!was_swapbacked && PageSwapBacked(page))
 					nr_lazyfree_fail++;
@@ -1243,6 +1246,14 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			case PAGE_ACTIVATE:
 				goto activate_locked;
 			case PAGE_SUCCESS:
+				if (in_jvm_heap_flag == IN_JVM_HEAP) {
+					adc_profile_counter_inc(ADC_SWAPOUT_IN_HEAP);
+				} else if (in_jvm_heap_flag == IN_JVM_HEAP_FREE) {
+					adc_profile_counter_inc(ADC_SWAPOUT_IN_HEAP);
+					adc_profile_counter_inc(ADC_SWAPOUT_IN_HEAP_FREE);
+				} else {
+					adc_profile_counter_inc(ADC_SWAPOUT_OUT_HEAP);
+				}
 				if (PageWriteback(page))
 					goto keep;
 				if (PageDirty(page))

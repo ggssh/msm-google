@@ -45,6 +45,8 @@
  *     pte map lock
  */
 
+#include "linux/mm_types.h"
+#include "linux/sched/signal.h"
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
@@ -71,6 +73,8 @@
 #include <trace/events/tlb.h>
 
 #include "internal.h"
+
+#include "linux/mm_stat.h"
 
 static struct kmem_cache *anon_vma_cachep;
 static struct kmem_cache *anon_vma_chain_cachep;
@@ -1669,7 +1673,7 @@ static int page_not_mapped(struct page *page)
  *
  * If unmap is successful, return true. Otherwise, false.
  */
-bool try_to_unmap(struct page *page, enum ttu_flags flags)
+bool __maybe_unused try_to_unmap(struct page *page, enum ttu_flags flags)
 {
 	struct rmap_walk_control rwc = {
 		.rmap_one = try_to_unmap_one,
@@ -1694,6 +1698,41 @@ bool try_to_unmap(struct page *page, enum ttu_flags flags)
 		rmap_walk_locked(page, &rwc);
 	else
 		rmap_walk(page, &rwc);
+
+	/*
+	 * When racing against e.g. zap_pte_range() on another cpu,
+	 * in between its ptep_get_and_clear_full() and page_remove_rmap(),
+	 * try_to_unmap() may return false when it is about to become true,
+	 * if page table locking is skipped: use TTU_SYNC to wait for that.
+	 */
+	return !page_mapcount(page);
+}
+
+bool __maybe_unused try_to_unmap_profiling(struct page *page, enum ttu_flags flags, enum jvm_heap_flag *in_jvm_heap_flag)
+{
+	struct rmap_walk_control rwc = {
+		.rmap_one = try_to_unmap_one,
+		.arg = (void *)flags,
+		.done = page_not_mapped,
+		.anon_lock = page_lock_anon_vma_read,
+	};
+
+	/*
+	 * During exec, a temporary VMA is setup and later moved.
+	 * The VMA is moved under the anon_vma lock but not the
+	 * page tables leading to a race where migration cannot
+	 * find the migration ptes. Rather than increasing the
+	 * locking requirements of exec(), migration skips
+	 * temporary VMAs until after exec() completes.
+	 */
+	if ((flags & (TTU_MIGRATION|TTU_SPLIT_FREEZE))
+	    && !PageKsm(page) && PageAnon(page))
+		rwc.invalid_vma = invalid_migration_vma;
+
+	if (flags & TTU_RMAP_LOCKED)
+		rmap_walk_locked_profiling(page, &rwc, in_jvm_heap_flag);
+	else
+		rmap_walk_profiling(page, &rwc, in_jvm_heap_flag);
 
 	/*
 	 * When racing against e.g. zap_pte_range() on another cpu,
@@ -1774,7 +1813,7 @@ static struct anon_vma *rmap_walk_anon_lock(struct page *page,
  * vm_flags for that VMA.  That should be OK, because that vma shouldn't be
  * LOCKED.
  */
-static void rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
+static void __maybe_unused rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
 		bool locked)
 {
 	struct anon_vma *anon_vma;
@@ -1810,6 +1849,94 @@ static void rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
 			break;
 	}
 
+	if (!locked)
+		anon_vma_unlock_read(anon_vma);
+}
+
+static void __maybe_unused rmap_walk_anon_profiling(struct page *page, struct rmap_walk_control *rwc,
+	bool locked, enum jvm_heap_flag *in_jvm_heap_flag)
+{
+	struct anon_vma *anon_vma;
+	pgoff_t pgoff_start, pgoff_end;
+	struct anon_vma_chain *avc;
+	bool in_jvm_heap = false, in_jvm_heap_free = false;
+	bool all_in_free = true;
+
+	if (locked) {
+		anon_vma = page_anon_vma(page);
+		/* anon_vma disappear under us? */
+		VM_BUG_ON_PAGE(!anon_vma, page);
+	} else {
+		anon_vma = rmap_walk_anon_lock(page, rwc);
+	}
+	if (!anon_vma)
+		return;
+
+	pgoff_start = page_to_pgoff(page);
+	pgoff_end = pgoff_start + hpage_nr_pages(page) - 1;
+	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root,
+			pgoff_start, pgoff_end) {
+		struct vm_area_struct *vma = avc->vma;
+		unsigned long address = vma_address(page, vma);
+		
+		struct task_struct *adc_owner = NULL;
+		pid_t pid;
+		struct adc_page_bitmap_entry *entry = NULL;
+
+#ifdef CONFIG_ADC_MEMCG
+		struct mm_struct *mm = vma->vm_mm;
+		adc_owner = READ_ONCE(mm->adc_owner);
+#endif
+		
+		// Generally speaking, every mm has an adc_owner, which is not NULL.(need check)
+		pid = adc_owner ? task_tgid_nr(adc_owner) : PID_MAX_LIMIT; 
+
+		// printk(KERN_INFO "YYZ: rmap_walk_anon_profiling: page %p, address %lx, vma %p, adc_owner %p, pid %d\n", page, address, vma, adc_owner, pid);
+		
+		VM_BUG_ON_VMA(address == -EFAULT, vma);
+		cond_resched();
+
+		if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
+			continue;
+		
+		if (pid != PID_MAX_LIMIT) {
+			entry = adc_get_bitmap_by_pid(pid);
+		}
+		
+		// Bitmap semantics: 1 = used (non-free), 0 = free, -1 = not in bitmap
+		if (entry) {
+			// test if the page is in the bitmap
+			if (test_adc_page_bitmap(address, entry) == 1) {
+				in_jvm_heap = true;
+				all_in_free = false;
+			} else if (test_adc_page_bitmap(address, entry) == 0) {
+				in_jvm_heap = true;
+			} else {
+				// test_adc_page_bitmap() == -1 : skip
+			}
+		} else {
+			// entry == null : skip
+			// printk(KERN_INFO "YYZ: rmap_walk_anon_profiling: entry == null, page %p, address %lx, vma %p, adc_owner %p, pid %d\n", page, address, vma, adc_owner, pid);
+		}
+
+		if (!rwc->rmap_one(page, vma, address, rwc->arg))
+			break;
+		if (rwc->done && rwc->done(page))
+			break;
+	}
+
+	if (in_jvm_heap && all_in_free) {
+		in_jvm_heap_free = true;
+	}
+
+	if (in_jvm_heap_free) {
+		*in_jvm_heap_flag = IN_JVM_HEAP_FREE;
+	} else if (in_jvm_heap) {
+		*in_jvm_heap_flag = IN_JVM_HEAP;
+	} else {
+		*in_jvm_heap_flag = OUT_JVM_HEAP;
+	}
+	
 	if (!locked)
 		anon_vma_unlock_read(anon_vma);
 }
@@ -1870,7 +1997,7 @@ done:
 		i_mmap_unlock_read(mapping);
 }
 
-void rmap_walk(struct page *page, struct rmap_walk_control *rwc)
+void __maybe_unused rmap_walk(struct page *page, struct rmap_walk_control *rwc)
 {
 	if (unlikely(PageKsm(page)))
 		rmap_walk_ksm(page, rwc);
@@ -1880,13 +2007,33 @@ void rmap_walk(struct page *page, struct rmap_walk_control *rwc)
 		rmap_walk_file(page, rwc, false);
 }
 
+void __maybe_unused rmap_walk_profiling(struct page *page, struct rmap_walk_control *rwc, enum jvm_heap_flag *in_jvm_heap_flag)
+{
+	if (unlikely(PageKsm(page)))
+		rmap_walk_ksm(page, rwc);
+	else if (PageAnon(page))
+		rmap_walk_anon_profiling(page, rwc, false, in_jvm_heap_flag);
+	else
+		rmap_walk_file(page, rwc, false);
+}
+
 /* Like rmap_walk, but caller holds relevant rmap lock */
-void rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc)
+void __maybe_unused rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc)
 {
 	/* no ksm support for now */
 	VM_BUG_ON_PAGE(PageKsm(page), page);
 	if (PageAnon(page))
 		rmap_walk_anon(page, rwc, true);
+	else
+		rmap_walk_file(page, rwc, true);
+}
+
+void __maybe_unused rmap_walk_locked_profiling(struct page *page, struct rmap_walk_control *rwc, enum jvm_heap_flag *in_jvm_heap_flag)
+{
+	/* no ksm support for now */
+	VM_BUG_ON_PAGE(PageKsm(page), page);
+	if (PageAnon(page))
+		rmap_walk_anon_profiling(page, rwc, true, in_jvm_heap_flag);
 	else
 		rmap_walk_file(page, rwc, true);
 }

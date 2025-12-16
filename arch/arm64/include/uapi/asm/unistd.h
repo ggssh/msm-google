@@ -18,3 +18,19 @@
 #define __ARCH_WANT_RENAMEAT
 
 #include <asm-generic/unistd.h>
+
+/* Custom system calls for ARM64 */
+#define __NR_init_page_bitmap 1081
+__SYSCALL(__NR_init_page_bitmap, sys_init_page_bitmap)
+
+#define __NR_mod_page_bitmap 1082
+__SYSCALL(__NR_mod_page_bitmap, sys_mod_page_bitmap)
+
+#define __NR_reset_swap_stats 1083
+__SYSCALL(__NR_reset_swap_stats, sys_reset_swap_stats)
+
+#define __NR_get_swap_stats 1084
+__SYSCALL(__NR_get_swap_stats, sys_get_swap_stats)
+
+#undef __NR_syscalls
+#define __NR_syscalls (__NR_get_swap_stats+1)

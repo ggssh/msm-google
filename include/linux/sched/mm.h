@@ -133,9 +133,10 @@ extern void exec_mm_release(struct task_struct *, struct mm_struct *);
 #ifdef CONFIG_MEMCG
 extern void mm_update_next_owner(struct mm_struct *mm);
 #else
-static inline void mm_update_next_owner(struct mm_struct *mm)
-{
-}
+// static inline void mm_update_next_owner(struct mm_struct *mm)
+// {
+// }
+extern void mm_update_next_owner(struct mm_struct *mm);
 #endif /* CONFIG_MEMCG */
 
 #ifdef CONFIG_MMU

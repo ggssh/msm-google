@@ -5,6 +5,7 @@
  * Declarations for Reverse Mapping functions in mm/rmap.c
  */
 
+#include "linux/mm_stat.h"
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
@@ -201,6 +202,7 @@ int page_referenced(struct page *, int is_locked,
 			struct mem_cgroup *memcg, unsigned long *vm_flags);
 
 bool try_to_unmap(struct page *, enum ttu_flags flags);
+bool try_to_unmap_profiling(struct page *, enum ttu_flags flags, enum jvm_heap_flag *in_jvm_heap_flag);
 
 /* Avoid racy checks */
 #define PVMW_SYNC		(1 << 0)
@@ -280,6 +282,8 @@ struct rmap_walk_control {
 
 void rmap_walk(struct page *page, struct rmap_walk_control *rwc);
 void rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc);
+void rmap_walk_profiling(struct page *page, struct rmap_walk_control *rwc, enum jvm_heap_flag *in_jvm_heap_flag);
+void rmap_walk_locked_profiling(struct page *page, struct rmap_walk_control *rwc, enum jvm_heap_flag *in_jvm_heap_flag);
 
 #else	/* !CONFIG_MMU */
 
@@ -296,6 +300,7 @@ static inline int page_referenced(struct page *page, int is_locked,
 }
 
 #define try_to_unmap(page, refs) false
+#define try_to_unmap_profiling(page, refs, in_jvm_heap_flag) false
 
 static inline int page_mkclean(struct page *page)
 {

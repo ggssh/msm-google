@@ -486,6 +486,91 @@ assign_new_owner:
 	task_unlock(c);
 	put_task_struct(c);
 }
+#else
+void mm_update_next_owner(struct mm_struct *mm)
+{
+#ifdef CONFIG_ADC_MEMCG
+	struct task_struct *c, *g, *p = current;
+
+retry:
+	/*
+	 * If the exiting or execing task is not the owner, it's
+	 * someone else's problem.
+	 */
+	if (mm->adc_owner != p)
+		return;
+	/*
+	 * The current owner is exiting/execing and there are no other
+	 * candidates.  Do not leave the mm pointing to a possibly
+	 * freed task structure.
+	 */
+	if (atomic_read(&mm->mm_users) <= 1) {
+		mm->adc_owner = NULL;
+		return;
+	}
+
+	read_lock(&tasklist_lock);
+	/*
+	 * Search in the children
+	 */
+	list_for_each_entry(c, &p->children, sibling) {
+		if (c->mm == mm)
+			goto assign_new_owner;
+	}
+
+	/*
+	 * Search in the siblings
+	 */
+	list_for_each_entry(c, &p->real_parent->children, sibling) {
+		if (c->mm == mm)
+			goto assign_new_owner;
+	}
+
+	/*
+	 * Search through everything else, we should not get here often.
+	 */
+	for_each_process(g) {
+		if (g->flags & PF_KTHREAD)
+			continue;
+		for_each_thread(g, c) {
+			if (c->mm == mm)
+				goto assign_new_owner;
+			if (c->mm)
+				break;
+		}
+	}
+	read_unlock(&tasklist_lock);
+	/*
+	 * We found no owner yet mm_users > 1: this implies that we are
+	 * most likely racing with swapoff (try_to_unuse()) or /proc or
+	 * ptrace or page migration (get_task_mm()).  Mark owner as NULL.
+	 */
+	mm->adc_owner = NULL;
+	return;
+
+assign_new_owner:
+	BUG_ON(c == p);
+	get_task_struct(c);
+	/*
+	 * The task_lock protects c->mm from changing.
+	 * We always want mm->adc_owner->mm == mm
+	 */
+	task_lock(c);
+	/*
+	 * Delay read_unlock() till we have the task_lock()
+	 * to ensure that c does not slip away underneath us
+	 */
+	read_unlock(&tasklist_lock);
+	if (c->mm != mm) {
+		task_unlock(c);
+		put_task_struct(c);
+		goto retry;
+	}
+	mm->adc_owner = c;
+	task_unlock(c);
+	put_task_struct(c);
+#endif
+}
 #endif /* CONFIG_MEMCG */
 
 /*
