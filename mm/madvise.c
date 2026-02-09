@@ -27,6 +27,7 @@
 #include <linux/mm_stat.h>
 #include <linux/types.h>
 #include <linux/timekeeping.h>
+#include "linux/mm.h"
 
 #include <asm/tlb.h>
 
@@ -1207,6 +1208,10 @@ madvise_behavior_valid(int behavior)
  */
 SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 {
+	return do_madvise(current->mm, start, len_in, behavior);
+}
+
+static inline int do_madvise_profiling(struct mm_struct *mm, unsigned long start, size_t len_in, int behavior, int* adc_pf_bits, uint64_t* madv_breakdown) {
 	unsigned long end, tmp;
 	struct vm_area_struct *vma, *prev;
 	int unmapped_error = 0;
@@ -1215,17 +1220,6 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 	size_t len;
 	struct blk_plug plug;
 
-#ifdef PROFILE_MADV_FREE_BREAKDOWN
-	uint64_t madv_breakdown[NUM_ADC_MADV_BREAKDOWN_TYPE] = {0};
-#endif
-	
-#ifdef PROFILE_MADV_FREE_BREAKDOWN
-	// yizhe: ADC_MADV_FREE_TOTAL Begin
-	uint64_t ts_stt = ktime_get_ns();
-	if (behavior == MADV_FREE) {
-		adc_madv_breakdown_stt(madv_breakdown, ADC_MADV_FREE_TOTAL, ts_stt);
-	}
-#endif
 	start = untagged_addr(start);
 
 	if (!madvise_behavior_valid(behavior))
@@ -1342,29 +1336,49 @@ out:
 		adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_MMAP_LOCK, ts_edt);
 	}
 	// yizhe: ADC_MADV_FREE_MMAP_LOCK End
-	
-	if (behavior == MADV_FREE) {
-		uint64_t ts_edt = ktime_get_ns();
-		adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_TOTAL, ts_edt);
-		// yizhe: ADC_MADV_FREE_TOTAL End
-
-// #ifdef PROFILE_MADV_FREE_BREAKDOWN
-		printk(KERN_INFO "YYZ : MADV_FREE [TOTAL]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_TOTAL]);
-		printk(KERN_INFO "YYZ : MADV_FREE [SINGLE_VMA]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_SINGLE_VMA]);
-		printk(KERN_INFO "YYZ : MADV_FREE [LRU]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_LRU]);
-		printk(KERN_INFO "YYZ : MADV_FREE [LRU_DRAIN]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_LRU_DRAIN]);
-		printk(KERN_INFO "YYZ : MADV_FREE [FLUSH_TLB]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_FLUSH_TLB]);
-		printk(KERN_INFO "YYZ : MADV_FREE [FLUSH_TLB_PEND]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_FLUSH_TLB_PEND]);
-		printk(KERN_INFO "YYZ : MADV_FREE [WALK_RANGE]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_RANGE]);
-		printk(KERN_INFO "YYZ : MADV_FREE [WALK_PMD]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_PMD]);
-		printk(KERN_INFO "YYZ : MADV_FREE [WALK_PTEs]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_PTEs]);
-		printk(KERN_INFO "YYZ : MADV_FREE [PTE_NOT_P]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PTE_NOT_P]);
-		printk(KERN_INFO "YYZ : MADV_FREE [MAKE_PTE]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_MAKE_PTE]);
-		printk(KERN_INFO "YYZ : MADV_FREE [MMAP_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_MMAP_LOCK]);
-		printk(KERN_INFO "YYZ : MADV_FREE [PTE_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PTE_LOCK]);
-		printk(KERN_INFO "YYZ : MADV_FREE [PAGE_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PAGE_LOCK]);
-// #endif /* PROFILE_MADV_FREE_BREAKDOWN */
-	}
 #endif
 	return error;
+}
+
+int __maybe_unused do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int behavior)
+{
+	return do_madvise_profiling(mm, start, len_in, behavior, NULL, NULL);
+}
+
+unsigned long __maybe_unused do_adc_madvise_profiling(struct mm_struct *mm, unsigned long start, size_t len_in, int behavior, size_t user_time)
+{
+#ifdef PROFILE_MADV_FREE_BREAKDOWN
+	uint64_t ts_stt = ktime_get_ns();
+	int adc_pf_bits = 0;
+	uint64_t madv_breakdown[NUM_ADC_MADV_BREAKDOWN_TYPE] = {0};
+
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_ENTER_SYSCALL, ts_stt - user_time);
+
+	ts_stt = ktime_get_ns();
+	adc_madv_breakdown_stt(madv_breakdown, ADC_MADV_FREE_TOTAL, ts_stt);
+	do_madvise_profiling(mm, start, len_in, behavior, &adc_pf_bits, madv_breakdown);
+	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_TOTAL, ktime_get_ns());
+	accum_adc_madv_breakdown(madv_breakdown, ADC_MADV_FREE_T);
+
+#ifdef PROFILE_MADV_FREE_BREAKDOWN_PRINT
+	printk(KERN_INFO "YYZ : MADV_FREE [ENTER_SYSCALL]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_ENTER_SYSCALL]);
+	printk(KERN_INFO "YYZ : MADV_FREE [SINGLE_VMA]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_SINGLE_VMA]);
+	printk(KERN_INFO "YYZ : MADV_FREE [LRU]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_LRU]);
+	printk(KERN_INFO "YYZ : MADV_FREE [LRU_DRAIN]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_LRU_DRAIN]);
+	printk(KERN_INFO "YYZ : MADV_FREE [FLUSH_TLB]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_FLUSH_TLB]);
+	printk(KERN_INFO "YYZ : MADV_FREE [FLUSH_TLB_PEND]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_FLUSH_TLB_PEND]);
+	printk(KERN_INFO "YYZ : MADV_FREE [WALK_RANGE]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_RANGE]);
+	printk(KERN_INFO "YYZ : MADV_FREE [WALK_PMD]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_PMD]);
+	printk(KERN_INFO "YYZ : MADV_FREE [WALK_PTEs]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_WALK_PTEs]);
+	printk(KERN_INFO "YYZ : MADV_FREE [PTE_NOT_P]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PTE_NOT_P]);
+	printk(KERN_INFO "YYZ : MADV_FREE [MAKE_PTE]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_MAKE_PTE]);
+	printk(KERN_INFO "YYZ : MADV_FREE [MMAP_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_MMAP_LOCK]);
+	printk(KERN_INFO "YYZ : MADV_FREE [PTE_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PTE_LOCK]);
+	printk(KERN_INFO "YYZ : MADV_FREE [PAGE_LOCK]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_PAGE_LOCK]);
+	printk(KERN_INFO "YYZ : MADV_FREE [TOTAL]: %lu ns\n", madv_breakdown[ADC_MADV_FREE_TOTAL]);
+#endif /* PROFILE_MADV_FREE_BREAKDOWN_PRINT */
+	return ktime_get_ns();
+#else
+	return do_madvise_profiling(mm, start, len_in, behavior, NULL, NULL);
+#endif
 }

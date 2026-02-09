@@ -32,5 +32,14 @@ __SYSCALL(__NR_reset_swap_stats, sys_reset_swap_stats)
 #define __NR_get_swap_stats 1084
 __SYSCALL(__NR_get_swap_stats, sys_get_swap_stats)
 
+#define __NR_madvise_profiling 1085
+__SYSCALL(__NR_madvise_profiling, sys_madvise_profiling)
+
+#define __NR_reset_madvise_breakdown 1086
+__SYSCALL(__NR_reset_madvise_breakdown, sys_reset_madvise_breakdown)
+
+#define __NR_dump_madvise_breakdown 1087
+__SYSCALL(__NR_dump_madvise_breakdown, sys_dump_madvise_breakdown)
+
 #undef __NR_syscalls
-#define __NR_syscalls (__NR_get_swap_stats+1)
+#define __NR_syscalls (__NR_dump_madvise_breakdown+1)

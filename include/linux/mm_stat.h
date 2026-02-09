@@ -27,6 +27,7 @@ enum adc_madv_breakdown_type {
 	ADC_MADV_FREE_MMAP_LOCK,
 	ADC_MADV_FREE_PTE_LOCK,
 	ADC_MADV_FREE_PAGE_LOCK,
+	ADC_MADV_FREE_ENTER_SYSCALL,
 	NUM_ADC_MADV_BREAKDOWN_TYPE,
 };
 
@@ -41,6 +42,8 @@ inline void adc_madv_breakdown_stt(uint64_t *madv_breakdown,
 inline void adc_madv_breakdown_end(uint64_t *madv_breakdown,
 				   enum adc_madv_breakdown_type type,
 				   uint64_t ts);
+inline void reset_adc_madv_breakdown(void);
+inline void dump_adc_madv_breakdown(void);
 inline void accum_adc_madv_breakdown(uint64_t madv_breakdown[],
 				     enum adc_madv_type madv_type);
 
@@ -110,7 +113,8 @@ struct adc_page_bitmap_entry {
 void init_adc_page_bitmap(unsigned long base, unsigned long page_number,
 			  unsigned long page_size);
 void free_adc_page_bitmap(void);
-int test_adc_page_bitmap(unsigned long addr, struct adc_page_bitmap_entry *entry);
+int test_adc_page_bitmap(unsigned long addr,
+			 struct adc_page_bitmap_entry *entry);
 void zero_adc_page_bitmap(void);
 void clear_adc_page_bitmap(unsigned long page_id);
 void set_adc_page_bitmap(unsigned long page_id);

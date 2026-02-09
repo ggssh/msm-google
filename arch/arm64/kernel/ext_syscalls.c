@@ -35,3 +35,22 @@ SYSCALL_DEFINE1(get_swap_stats, struct swap_stats __user *, stats)
 	get_adc_swap_stats(&s);
 	return copy_to_user(stats, &s, sizeof(struct swap_stats)) ? -EFAULT : 0;
 }
+
+SYSCALL_DEFINE4(madvise_profiling, unsigned long, start, unsigned long, len_in, int, behavior, unsigned long, user_time)
+{
+	return do_adc_madvise_profiling(current->mm, start, len_in, behavior, user_time);
+}
+
+SYSCALL_DEFINE0(reset_madvise_breakdown)
+{
+	// printk(KERN_INFO "YYZ: reset madvise breakdown\n");
+	reset_adc_madv_breakdown();
+	return 0;
+}
+
+SYSCALL_DEFINE0(dump_madvise_breakdown)
+{
+	// printk(KERN_INFO "YYZ: dump madvise breakdown\n");
+	dump_adc_madv_breakdown();
+	return 0;
+}

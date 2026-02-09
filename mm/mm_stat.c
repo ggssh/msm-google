@@ -1,5 +1,7 @@
+#include "asm/cache.h"
 #include "linux/bitops.h"
 #include "linux/mm.h"
+#include "linux/types.h"
 #include <linux/mm_stat.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -10,6 +12,24 @@
 #define ADC_BITMAP_HASH_SIZE (1 << ADC_BITMAP_HASH_BITS)
 static DEFINE_HASHTABLE(adc_bitmap_hash, ADC_BITMAP_HASH_BITS);
 static DEFINE_SPINLOCK(adc_bitmap_lock);
+
+struct adc_madv_time_stat_list {
+	atomic64_t accum_vals[NUM_ADC_MADV_BREAKDOWN_TYPE];
+	atomic_t cnt;
+};
+
+struct adc_madv_time_stat_list adc_madv_breakdowns[NUM_ADC_MADV_TYPE];
+static const char
+	*adc_madv_breakdown_names[NUM_ADC_MADV_BREAKDOWN_TYPE] __read_mostly = {
+		"ADC_MADV_FREE_TOTAL",	       "ADC_MADV_FREE_SINGLE_VMA",
+		"ADC_MADV_FREE_LRU",	       "ADC_MADV_FREE_LRU_DRAIN",
+		"ADC_MADV_FREE_FLUSH_TLB",     "ADC_MADV_FREE_FLUSH_TLB_PEND",
+		"ADC_MADV_FREE_WALK_RANGE",    "ADC_MADV_FREE_WALK_PMD",
+		"ADC_MADV_FREE_WALK_PTEs",     "ADC_MADV_FREE_PTE_NOT_P",
+		"ADC_MADV_FREE_MAKE_PTE",      "ADC_MADV_FREE_MMAP_LOCK",
+		"ADC_MADV_FREE_PTE_LOCK",      "ADC_MADV_FREE_PAGE_LOCK",
+		"ADC_MADV_FREE_ENTER_SYSCALL",
+	};
 
 // yizhe: MADV_FREE breakdown
 inline void adc_madv_breakdown_stt(uint64_t *madv_breakdown,
@@ -28,6 +48,49 @@ inline void adc_madv_breakdown_end(uint64_t *madv_breakdown,
 	if (!madv_breakdown)
 		return;
 	madv_breakdown[type] += ts;
+}
+
+inline void reset_adc_madv_breakdown(void)
+{
+	int i, j;
+	for (i = 0; i < NUM_ADC_MADV_TYPE; i++) {
+		for (j = 0; j < NUM_ADC_MADV_BREAKDOWN_TYPE; j++) {
+			atomic64_set(&adc_madv_breakdowns[i].accum_vals[j], 0);
+		}
+		atomic_set(&adc_madv_breakdowns[i].cnt, 0);
+	}
+}
+
+inline void accum_adc_madv_breakdown(uint64_t madv_breakdown[],
+				     enum adc_madv_type madv_type)
+{
+	const int MAX_CNT = (1 << 30);
+	if (!madv_breakdown)
+		return;
+	if (atomic_read(&adc_madv_breakdowns[madv_type].cnt) < MAX_CNT) {
+		int i;
+		atomic_inc(&adc_madv_breakdowns[madv_type].cnt);
+		for (i = 0; i < NUM_ADC_MADV_BREAKDOWN_TYPE; i++) {
+			atomic64_add(
+				madv_breakdown[i],
+				&adc_madv_breakdowns[madv_type].accum_vals[i]);
+		}
+	}
+}
+
+inline void dump_adc_madv_breakdown(void)
+{
+	int i, j;
+	for (i = 0; i < NUM_ADC_MADV_TYPE; i++) {
+		printk(KERN_INFO "YYZ: MADV_FREE: %lu times\n",
+		       atomic64_read(&adc_madv_breakdowns[i].cnt));
+		for (j = 0; j < NUM_ADC_MADV_BREAKDOWN_TYPE; j++) {
+			printk(KERN_INFO "YYZ: MADV_FREE [%s]: %lu ns\n",
+			       adc_madv_breakdown_names[j],
+			       atomic64_read(
+				       &adc_madv_breakdowns[i].accum_vals[j]));
+		}
+	}
 }
 
 // yizhe: profile counters
