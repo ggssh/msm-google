@@ -94,6 +94,7 @@ enum jvm_heap_flag {
 // Page view       |   page 0   |   page 1   |   ...   | page (page_number -1) |
 // Bitmap view       |   bit 0      |   bit 1      |   ...   | bit (page_number -1)    |
 //
+// [base, end)
 struct adc_page_bitmap {
 	unsigned long base; // start address of consecutive pages
 	unsigned long end; // end address of consecutive pages
@@ -116,9 +117,11 @@ void free_adc_page_bitmap(void);
 int test_adc_page_bitmap(unsigned long addr,
 			 struct adc_page_bitmap_entry *entry);
 void zero_adc_page_bitmap(void);
-void clear_adc_page_bitmap(unsigned long page_id);
-void set_adc_page_bitmap(unsigned long page_id);
-void mod_adc_page_bitmap(unsigned int mode, unsigned long page_id);
+void clear_adc_page_bitmap(unsigned long from_page_id,
+			   unsigned long to_page_id);
+void set_adc_page_bitmap(unsigned long from_page_id, unsigned long to_page_id);
+void mod_adc_page_bitmap(unsigned int mode, unsigned long from_page_id,
+			 unsigned long to_page_id);
 struct adc_page_bitmap_entry *adc_get_bitmap_by_pid(pid_t pid);
 
 static inline unsigned long addr_to_pageid(struct adc_page_bitmap *pages,

@@ -16,9 +16,9 @@ SYSCALL_DEFINE3(init_page_bitmap, unsigned long, base, unsigned long,
 	return 0;
 }
 
-SYSCALL_DEFINE2(mod_page_bitmap, unsigned int, mode, unsigned long, page_id)
+SYSCALL_DEFINE3(mod_page_bitmap, unsigned int, mode, unsigned long, from_page_id, unsigned long, to_page_id)
 {
-	mod_adc_page_bitmap(mode, page_id);
+	mod_adc_page_bitmap(mode, from_page_id, to_page_id);
 	return 0;
 }
 

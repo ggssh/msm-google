@@ -107,6 +107,8 @@ void reset_adc_swap_stats(void)
 
 void get_adc_swap_stats(struct swap_stats *stats)
 {
+	if (!stats)
+		return;
 	// total stats, does not distinguish between process types.
 	stats->swapin_out_heap = get_adc_profile_counter(ADC_SWAPIN_OUT_HEAP);
 	stats->swapin_in_heap = get_adc_profile_counter(ADC_SWAPIN_IN_HEAP);
@@ -287,43 +289,51 @@ void zero_adc_page_bitmap(void)
 	}
 }
 
-void clear_adc_page_bitmap(unsigned long page_id)
+void clear_adc_page_bitmap(unsigned long from_page_id, unsigned long to_page_id)
 {
 	struct adc_page_bitmap_entry *entry = get_current_bitmap();
 	if (entry && entry->bitmap.map != NULL &&
-	    page_id < entry->bitmap.page_number) {
-		__clear_bit(page_id, entry->bitmap.map);
+	    from_page_id < entry->bitmap.page_number &&
+	    to_page_id < entry->bitmap.page_number) {
+		int i;
+		for (i = from_page_id; i <= to_page_id; i++) {
+			__clear_bit(i, entry->bitmap.map);
+		}
 	} else if (entry) {
 		printk("YYZ: clear page bitmap: page id %lu large than %lu\n",
-		       page_id, entry->bitmap.page_number - 1);
+		       to_page_id, entry->bitmap.page_number - 1);
 	}
 }
 
-void set_adc_page_bitmap(unsigned long page_id)
+void set_adc_page_bitmap(unsigned long from_page_id, unsigned long to_page_id)
 {
 	struct adc_page_bitmap_entry *entry = get_current_bitmap();
 	if (entry && entry->bitmap.map != NULL &&
-	    page_id < entry->bitmap.page_number) {
-		__set_bit(page_id, entry->bitmap.map);
+	    from_page_id < entry->bitmap.page_number &&
+	    to_page_id < entry->bitmap.page_number) {
+		int i;
+		for (i = from_page_id; i <= to_page_id; i++) {
+			__set_bit(i, entry->bitmap.map);
+		}
 	} else if (entry) {
 		if (entry->bitmap.map == NULL) {
 			printk("YYZ: set page bitmap: bitmap is NULL\n");
 			return;
 		}
 		printk("YYZ: set page bitmap: page id %lu large than %lu\n",
-		       page_id, entry->bitmap.page_number - 1);
+		       to_page_id, entry->bitmap.page_number - 1);
 	}
 }
 
 // @mode 0: free bitmap
-//       1: remove all pages
-// 		 2: remove a page
-// 		 3: add a page
-//       4: add consecutive pages [0, page_id]
-//       5: add consecutive pages [page_id, page_number)
-// 		 other: dump page bitmap to dmesg
-// @page_id: id of page
-void mod_adc_page_bitmap(unsigned int mode, unsigned long page_id)
+//       1: zero bitmap (remove all pages)
+//       2: clear bits in [from_page_id, to_page_id]
+//       3: set bits in [from_page_id, to_page_id]
+//       other: dump page bitmap to dmesg
+// @from_page_id, @to_page_id: closed interval [from_page_id, to_page_id]
+//       (used for mode 2 and 3; ignored for mode 0 and 1)
+void mod_adc_page_bitmap(unsigned int mode, unsigned long from_page_id,
+			 unsigned long to_page_id)
 {
 	struct adc_page_bitmap_entry *entry = NULL;
 
@@ -335,35 +345,10 @@ void mod_adc_page_bitmap(unsigned int mode, unsigned long page_id)
 		zero_adc_page_bitmap();
 	} else if (mode == 2) {
 		// printk("syscall(454): clear bit[%lu]\n", page_id);
-		clear_adc_page_bitmap(page_id);
+		clear_adc_page_bitmap(from_page_id, to_page_id);
 	} else if (mode == 3) {
 		// printk("syscall(454): set bit[%lu]\n", page_id);
-		set_adc_page_bitmap(page_id);
-	} else if (mode == 4) {
-		int i;
-		entry = get_current_bitmap();
-		if (!entry) {
-			printk("YYZ: syscall(1082): no bitmap entry for current process\n");
-			return;
-		}
-		printk("YYZ: syscall(1082): set bit range in [0,%lu]\n",
-		       page_id);
-		for (i = 0; i <= page_id && i < entry->bitmap.page_number;
-		     i++) {
-			set_adc_page_bitmap(i);
-		}
-	} else if (mode == 5) {
-		int i;
-		entry = get_current_bitmap();
-		if (!entry) {
-			printk("YYZ: syscall(1082): no bitmap entry for current process\n");
-			return;
-		}
-		printk("YYZ: syscall(1082): set bit range in [%lu, page_number)\n",
-		       page_id);
-		for (i = page_id; i < entry->bitmap.page_number; i++) {
-			set_adc_page_bitmap(i);
-		}
+		set_adc_page_bitmap(from_page_id, to_page_id);
 	} else {
 		printk("YYZ: syscall(1082): illegal mode %u, will dump bitmap\n",
 		       mode);

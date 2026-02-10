@@ -13,7 +13,7 @@
 
 // page bitmap
 asmlinkage long sys_init_page_bitmap(unsigned long, unsigned long, unsigned long);
-asmlinkage long sys_mod_page_bitmap(unsigned int, unsigned long);
+asmlinkage long sys_mod_page_bitmap(unsigned int, unsigned long, unsigned long);
 
 // swap stats
 asmlinkage long sys_reset_swap_stats(void);
