@@ -6,6 +6,7 @@
  */
 
 #include "linux/mm_stat.h"
+#include "linux/mm_types.h"
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
@@ -105,6 +106,7 @@ enum ttu_flags {
 					 * caller holds it */
 	TTU_SPLIT_FREEZE	= 0x100, /* freeze pte under splitting thp */
 	TTU_SYNC		= 0x200, /* avoid racy checks with PVMW_SYNC */
+	TTU_ADC_FREE 		= 0x400, /* free page by adc advise */
 };
 
 #ifdef CONFIG_MMU
@@ -202,6 +204,9 @@ int page_referenced(struct page *, int is_locked,
 			struct mem_cgroup *memcg, unsigned long *vm_flags);
 
 bool try_to_unmap(struct page *, enum ttu_flags flags);
+#ifdef ADC_ADVISE_SWAPOUT_SKIP_WALK_RMAP_FOR_UNMAP
+bool try_to_unmap_addr(struct page *, enum ttu_flags flags, unsigned long vaddr, struct vm_area_struct *vma, struct adc_page_bitmap_entry *bitmap_entry);
+#endif
 bool try_to_unmap_profiling(struct page *, enum ttu_flags flags, enum jvm_heap_flag *in_jvm_heap_flag);
 
 /* Avoid racy checks */
@@ -280,6 +285,7 @@ struct rmap_walk_control {
 	bool (*invalid_vma)(struct vm_area_struct *vma, void *arg);
 };
 
+enum jvm_heap_flag adc_check_page_freed(struct page *, unsigned long *addr, struct vm_area_struct **vma_p, struct adc_page_bitmap_entry **bitmap_entry);
 void rmap_walk(struct page *page, struct rmap_walk_control *rwc);
 void rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc);
 void rmap_walk_profiling(struct page *page, struct rmap_walk_control *rwc, enum jvm_heap_flag *in_jvm_heap_flag);
@@ -300,6 +306,9 @@ static inline int page_referenced(struct page *page, int is_locked,
 }
 
 #define try_to_unmap(page, refs) false
+#ifdef ADC_ADVISE_SWAPOUT_SKIP_WALK_RMAP_FOR_UNMAP
+#define try_to_unmap_addr(page, refs, vaddr, vma, bitmap_entry) false
+#endif
 #define try_to_unmap_profiling(page, refs, in_jvm_heap_flag) false
 
 static inline int page_mkclean(struct page *page)

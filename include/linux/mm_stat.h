@@ -9,6 +9,7 @@
 #include "linux/hashtable.h"
 #include "linux/sched.h"
 #include "linux/spinlock.h"
+#include "linux/mm_stat_macro.h"
 #include "asm-generic/atomic-long.h"
 
 // yizhe: MADV_FREE breakdown

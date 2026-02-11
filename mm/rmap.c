@@ -1328,6 +1328,333 @@ void page_remove_rmap(struct page *page, bool compound)
 }
 
 /*
+ * Same to try_to_unmap_one but used by adv advise only.
+ * The caller will make sure we enable Skipswap for this page and
+ * it is an anon page and not shared with other process.
+ */
+static __maybe_unused bool try_to_unmap_one_adc_advise(struct page *page, struct vm_area_struct *vma,
+		     unsigned long address, struct adc_page_bitmap_entry *bitmap_entry, void *arg)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	struct page_vma_mapped_walk pvmw = {
+		.page = page,
+		.vma = vma,
+		.address = address,
+	};
+	pte_t pteval;
+	struct page *subpage;
+	bool ret = true;
+	unsigned long start = address, end;
+	enum ttu_flags flags = (enum ttu_flags)arg;
+
+	/*
+	 * When racing against e.g. zap_pte_range() on another cpu,
+	 * in between its ptep_get_and_clear_full() and page_remove_rmap(),
+	 * try_to_unmap() may return false when it is about to become true,
+	 * if page table locking is skipped: use TTU_SYNC to wait for that.
+	 */
+	if (flags & TTU_SYNC)
+		pvmw.flags = PVMW_SYNC;
+
+	/* munlock has nothing to gain from examining un-locked vmas */
+	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
+		return true;
+
+	if (IS_ENABLED(CONFIG_MIGRATION) && (flags & TTU_MIGRATION) &&
+	    is_zone_device_page(page) && !is_device_private_page(page))
+		return true;
+
+	if (flags & TTU_SPLIT_HUGE_PMD) {
+		split_huge_pmd_address(vma, address,
+				flags & TTU_SPLIT_FREEZE, page);
+	}
+
+	/*
+	 * For THP, we have to assume the worse case ie pmd for invalidation.
+	 * For hugetlb, it could be much worse if we need to do pud
+	 * invalidation in the case of pmd sharing.
+	 *
+	 * Note that the page can not be free in this function as call of
+	 * try_to_unmap() must hold a reference on the page.
+	 */
+	end = PageKsm(page) ?
+			address + PAGE_SIZE : vma_address_end(page, vma);
+	if (PageHuge(page)) {
+		/*
+		 * If sharing is possible, start and end will be adjusted
+		 * accordingly.
+		 */
+		adjust_range_if_pmd_sharing_possible(vma, &start, &end);
+	}
+	mmu_notifier_invalidate_range_start(vma->vm_mm, start, end);
+
+	while (page_vma_mapped_walk(&pvmw)) {
+#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+		/* PMD-mapped THP migration entry */
+		if (!pvmw.pte && (flags & TTU_MIGRATION)) {
+			VM_BUG_ON_PAGE(PageHuge(page) || !PageTransCompound(page), page);
+
+			if (!PageAnon(page))
+				continue;
+
+			set_pmd_migration_entry(&pvmw, page);
+			continue;
+		}
+#endif
+
+		/*
+		 * If the page is mlock()d, we cannot swap it out.
+		 * If it's recently referenced (perhaps page_referenced
+		 * skipped over this mm) then we should reactivate it.
+		 */
+		if (!(flags & TTU_IGNORE_MLOCK)) {
+			if (vma->vm_flags & VM_LOCKED) {
+				/* PTE-mapped THP are never mlocked */
+				if (!PageTransCompound(page)) {
+					/*
+					 * Holding pte lock, we do *not* need
+					 * mmap_sem here
+					 */
+					mlock_vma_page(page);
+				}
+				ret = false;
+				page_vma_mapped_walk_done(&pvmw);
+				break;
+			}
+			if (flags & TTU_MUNLOCK)
+				continue;
+		}
+
+		/* Unexpected PMD-mapped THP? */
+		VM_BUG_ON_PAGE(!pvmw.pte, page);
+
+		subpage = page - page_to_pfn(page) + pte_pfn(*pvmw.pte);
+		address = pvmw.address;
+
+		if (PageHuge(page)) {
+			if (huge_pmd_unshare(mm, &address, pvmw.pte)) {
+				/*
+				 * huge_pmd_unshare unmapped an entire PMD
+				 * page.  There is no way of knowing exactly
+				 * which PMDs may be cached for this mm, so
+				 * we must flush them all.  start/end were
+				 * already adjusted above to cover this range.
+				 */
+				flush_cache_range(vma, start, end);
+				flush_tlb_range(vma, start, end);
+				mmu_notifier_invalidate_range(mm, start, end);
+
+				/*
+				 * The ref count of the PMD page was dropped
+				 * which is part of the way map counting
+				 * is done for shared PMDs.  Return 'true'
+				 * here.  When there is no other sharing,
+				 * huge_pmd_unshare returns false and we will
+				 * unmap the actual page and drop map count
+				 * to zero.
+				 */
+				page_vma_mapped_walk_done(&pvmw);
+				break;
+			}
+		}
+
+		if (IS_ENABLED(CONFIG_MIGRATION) &&
+		    (flags & TTU_MIGRATION) &&
+		    is_zone_device_page(page)) {
+			swp_entry_t entry;
+			pte_t swp_pte;
+
+			pteval = ptep_get_and_clear(mm, pvmw.address, pvmw.pte);
+
+			/*
+			 * Store the pfn of the page in a special migration
+			 * pte. do_swap_page() will wait until the migration
+			 * pte is removed and then restart fault handling.
+			 */
+			entry = make_migration_entry(page, 0);
+			swp_pte = swp_entry_to_pte(entry);
+			if (pte_soft_dirty(pteval))
+				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+			set_pte_at(mm, pvmw.address, pvmw.pte, swp_pte);
+			goto discard;
+		}
+
+		if (!(flags & TTU_IGNORE_ACCESS)) {
+			if (ptep_clear_flush_young_notify(vma, address,
+						pvmw.pte)) {
+				ret = false;
+				page_vma_mapped_walk_done(&pvmw);
+				break;
+			}
+		}
+
+		/* Nuke the page table entry. */
+		flush_cache_page(vma, address, pte_pfn(*pvmw.pte));
+		if (should_defer_flush(mm, flags)) {
+			/*
+			 * We clear the PTE but do not flush so potentially
+			 * a remote CPU could still be writing to the page.
+			 * If the entry was previously clean then the
+			 * architecture must guarantee that a clear->dirty
+			 * transition on a cached TLB entry is written through
+			 * and traps if the PTE is unmapped.
+			 * 
+			 * Here 'write through' means modify the PTE in main memory,
+			 * thus finds it has been cleared and traps.
+			 */
+			pteval = ptep_get_and_clear(mm, address, pvmw.pte);
+
+			set_tlb_ubc_flush_pending(mm, pte_dirty(pteval));
+		} else {
+			pteval = ptep_clear_flush(vma, address, pvmw.pte);
+		}
+
+#ifdef ADC_ADVISE_FREE_BYPASS_ALLOC_SWAP_ENTRY
+		if (bitmap_entry && (flags & TTU_ADC_FREE) && test_adc_page_bitmap(address, bitmap_entry) == 0) {
+			// The page is still free here, we can keep the PET clear and make page clean.
+			ClearPageDirty(page);
+		} else if (pte_dirty(pteval)) {
+			// Move the dirty bit to the page. Now the pte is gone.
+			set_page_dirty(page);
+		}
+#else
+		/* Move the dirty bit to the page. Now the pte is gone. */
+		if (pte_dirty(pteval))
+			set_page_dirty(page);
+#endif
+		/* Update high watermark before we lower rss */
+		update_hiwater_rss(mm);
+
+		if (PageHWPoison(page) && !(flags & TTU_IGNORE_HWPOISON)) {
+			pteval = swp_entry_to_pte(make_hwpoison_entry(subpage));
+			if (PageHuge(page)) {
+				int nr = 1 << compound_order(page);
+				hugetlb_count_sub(nr, mm);
+				set_huge_swap_pte_at(mm, address,
+						     pvmw.pte, pteval,
+						     vma_mmu_pagesize(vma));
+			} else {
+				dec_mm_counter(mm, mm_counter(page));
+				set_pte_at(mm, address, pvmw.pte, pteval);
+			}
+
+		} else if (pte_unused(pteval) && !userfaultfd_armed(vma)) {
+			/*
+			 * The guest indicated that the page content is of no
+			 * interest anymore. Simply discard the pte, vmscan
+			 * will take care of the rest.
+			 * A future reference will then fault in a new zero
+			 * page. When userfaultfd is active, we must not drop
+			 * this page though, as its main user (postcopy
+			 * migration) will not expect userfaults on already
+			 * copied pages.
+			 */
+			dec_mm_counter(mm, mm_counter(page));
+		} else if (IS_ENABLED(CONFIG_MIGRATION) &&
+				(flags & (TTU_MIGRATION|TTU_SPLIT_FREEZE))) {
+			swp_entry_t entry;
+			pte_t swp_pte;
+			/*
+			 * Store the pfn of the page in a special migration
+			 * pte. do_swap_page() will wait until the migration
+			 * pte is removed and then restart fault handling.
+			 */
+			entry = make_migration_entry(subpage,
+					pte_write(pteval));
+			swp_pte = swp_entry_to_pte(entry);
+			if (pte_soft_dirty(pteval))
+				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+			set_pte_at(mm, address, pvmw.pte, swp_pte);
+		} else if (PageAnon(page)) {
+			swp_entry_t entry = { .val = page_private(subpage) };
+			pte_t swp_pte;
+			/*
+			 * Store the swap location in the pte.
+			 * See handle_pte_fault() ...
+			 */
+			if (unlikely(PageSwapBacked(page) != PageSwapCache(page))) {
+				WARN_ON_ONCE(1);
+				ret = false;
+				/* We have to invalidate as we cleared the pte */
+				page_vma_mapped_walk_done(&pvmw);
+				break;
+			}
+
+			/* MADV_FREE page check */
+			// Adc free page: we have set PageSwapBacked and PageClean before.
+			if (!PageSwapBacked(page)) {
+				int ref_count, map_count;
+
+				/*
+				 * Synchronize with gup_pte_range():
+				 * - clear PTE; barrier; read refcount
+				 * - inc refcount; barrier; read PTE
+				 */
+				smp_mb();
+
+				ref_count = page_ref_count(page);
+				map_count = page_mapcount(page);
+
+				/*
+				 * Order reads for page refcount and dirty flag
+				 * (see comments in __remove_mapping()).
+				 */
+				smp_rmb();
+
+				/*
+				 * The only page refs must be one from isolation
+				 * plus the rmap(s) (dropped by discard:).
+				 */
+				if (ref_count == 1 + map_count &&
+				    !PageDirty(page)) {
+					dec_mm_counter(mm, MM_ANONPAGES);
+					goto discard;
+				}
+
+				/*
+				 * If the page was redirtied, it cannot be
+				 * discarded. Remap the page to page table.
+				 */
+				set_pte_at(mm, address, pvmw.pte, pteval);
+				SetPageSwapBacked(page);
+				ret = false;
+				page_vma_mapped_walk_done(&pvmw);
+				break;
+			}
+
+			if (swap_duplicate(entry) < 0) {
+				set_pte_at(mm, address, pvmw.pte, pteval);
+				ret = false;
+				page_vma_mapped_walk_done(&pvmw);
+				break;
+			}
+			if (list_empty(&mm->mmlist)) {
+				spin_lock(&mmlist_lock);
+				if (list_empty(&mm->mmlist))
+					list_add(&mm->mmlist, &init_mm.mmlist);
+				spin_unlock(&mmlist_lock);
+			}
+			dec_mm_counter(mm, MM_ANONPAGES);
+			inc_mm_counter(mm, MM_SWAPENTS);
+			swp_pte = swp_entry_to_pte(entry);
+			if (pte_soft_dirty(pteval))
+				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+			set_pte_at(mm, address, pvmw.pte, swp_pte);
+		} else
+			dec_mm_counter(mm, mm_counter_file(page));
+discard:
+		page_remove_rmap(subpage, PageHuge(page));
+		put_page(page);
+		mmu_notifier_invalidate_range(mm, address,
+					      address + PAGE_SIZE);
+	}
+
+	mmu_notifier_invalidate_range_end(vma->vm_mm, start, end);
+
+	return ret;
+}
+
+/*
  * @arg: enum ttu_flags will be passed to this argument
  */
 static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
@@ -1708,6 +2035,18 @@ bool __maybe_unused try_to_unmap(struct page *page, enum ttu_flags flags)
 	return !page_mapcount(page);
 }
 
+#ifdef ADC_ADVISE_SWAPOUT_SKIP_WALK_RMAP_FOR_UNMAP
+bool try_to_unmap_addr(struct page *page, enum ttu_flags flags, unsigned long vaddr, struct vm_area_struct *vma, struct adc_page_bitmap_entry *bitmap_entry)
+{
+	if (bitmap_entry && PageAnon(page) && page_mapped(page) && (page_mapcount(page) == 1)) {
+		return try_to_unmap_one_adc_advise(page, vma, vaddr, bitmap_entry, (void *)flags);
+		// return try_to_unmap(page, flags);
+	} else {
+		return try_to_unmap(page, flags);
+	}
+}
+#endif
+
 bool __maybe_unused try_to_unmap_profiling(struct page *page, enum ttu_flags flags, enum jvm_heap_flag *in_jvm_heap_flag)
 {
 	struct rmap_walk_control rwc = {
@@ -1851,6 +2190,71 @@ static void __maybe_unused rmap_walk_anon(struct page *page, struct rmap_walk_co
 
 	if (!locked)
 		anon_vma_unlock_read(anon_vma);
+}
+
+enum jvm_heap_flag adc_check_page_freed(struct page *page, unsigned long *addr, struct vm_area_struct **vma_p, struct adc_page_bitmap_entry **bitmap_entry)
+{
+	// Walk rmap to check page free
+	struct vm_area_struct *vma;
+	struct anon_vma *anon_vma;
+	struct anon_vma_chain *avc;
+	pgoff_t pgoff;
+	unsigned long address;
+	int res;
+	bool in_jvm_heap = false, in_jvm_heap_free = false, out_jvm_heap = false;
+	struct task_struct *adc_owner = NULL;
+	pid_t pid;
+	struct adc_page_bitmap_entry *entry = NULL;
+
+	if (page_mapcount(page) != 1){
+		return OUT_JVM_HEAP;
+	}
+
+	anon_vma = page_lock_anon_vma_read(page);
+	if (!anon_vma)
+		return OUT_JVM_HEAP;
+
+	pgoff = page_to_pgoff(page);
+	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root,
+			pgoff, pgoff + hpage_nr_pages(page) - 1) {
+		vma = avc->vma;
+		address = vma_address(page, vma);
+#ifdef CONFIG_ADC_MEMCG
+		adc_owner = READ_ONCE(vma->vm_mm->adc_owner);
+#endif
+		pid = adc_owner ? task_tgid_nr(adc_owner) : PID_MAX_LIMIT;
+		if (pid != PID_MAX_LIMIT) {
+			entry = adc_get_bitmap_by_pid(pid);
+		}
+		if (!entry) {
+			out_jvm_heap = true;
+			break;
+		}
+
+		res = test_adc_page_bitmap(address, entry);
+		if (res == 1) {
+			in_jvm_heap = true;
+		} else if (res == 0) {
+			in_jvm_heap_free = true;
+		} else {
+			out_jvm_heap = true;
+		}
+		*addr = address;
+		*vma_p = vma;
+		*bitmap_entry = entry;
+		break;
+	}
+
+	page_unlock_anon_vma_read(anon_vma);
+
+	if (out_jvm_heap)
+		return OUT_JVM_HEAP;
+	else if (in_jvm_heap)
+		return IN_JVM_HEAP;
+	else if (in_jvm_heap_free)
+		return IN_JVM_HEAP_FREE;
+	else
+		return OUT_JVM_HEAP;
 }
 
 static void __maybe_unused rmap_walk_anon_profiling(struct page *page, struct rmap_walk_control *rwc,
