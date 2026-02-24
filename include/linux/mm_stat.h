@@ -56,6 +56,10 @@ struct swap_stats {
 	unsigned long swapout_out_heap;
 	unsigned long swapout_in_heap;
 	unsigned long swapout_in_heap_free;
+#ifdef ADC_PROFILE_SWAP_OUT_CPUTIME
+	unsigned long shrink_page_list_nr_pages;
+	unsigned long long shrink_page_list_time_ns;
+#endif
 };
 
 enum adc_counter_type {
@@ -65,6 +69,10 @@ enum adc_counter_type {
 	ADC_SWAPOUT_OUT_HEAP,
 	ADC_SWAPOUT_IN_HEAP,
 	ADC_SWAPOUT_IN_HEAP_FREE,
+#ifdef ADC_PROFILE_SWAP_OUT_CPUTIME
+	ADC_SHRINK_PAGE_LIST_NR_PAGES,
+	ADC_SHRINK_PAGE_LIST_TIME_NS,
+#endif
 	NUM_ADC_COUNTER_TYPE
 };
 

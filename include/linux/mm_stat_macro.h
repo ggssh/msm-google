@@ -11,4 +11,6 @@
     #define ADC_ADVISE_SWAPOUT_SKIP_WALK_RMAP_FOR_UNMAP 1
 #endif
 
+#define ADC_PROFILE_SWAP_OUT_CPUTIME 1
+
 #endif

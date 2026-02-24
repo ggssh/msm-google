@@ -61,6 +61,7 @@
 #include "linux/page-flags.h"
 
 #include "linux/mm_stat.h"
+#include <linux/timekeeping.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
@@ -997,11 +998,17 @@ static unsigned long shrink_page_list_profiling(struct list_head *page_list,
 		struct vm_area_struct *vma;
 		struct adc_page_bitmap_entry *bitmap_entry = NULL;
 #endif
+#ifdef ADC_PROFILE_SWAP_OUT_CPUTIME
+		u64 page_ts_start;
+#endif
 
 		cond_resched();
 
 		page = lru_to_page(page_list);
 		list_del(&page->lru);
+#ifdef ADC_PROFILE_SWAP_OUT_CPUTIME
+		page_ts_start = ktime_get_ns();
+#endif
 
 		if (!trylock_page(page))
 			goto keep;
@@ -1373,6 +1380,10 @@ static unsigned long shrink_page_list_profiling(struct list_head *page_list,
 		 */
 		__ClearPageLocked(page);
 free_it:
+#ifdef ADC_PROFILE_SWAP_OUT_CPUTIME
+		adc_profile_counter_inc(ADC_SHRINK_PAGE_LIST_NR_PAGES);
+		adc_profile_counter_add(ADC_SHRINK_PAGE_LIST_TIME_NS, (long)(ktime_get_ns() - page_ts_start));
+#endif
 		if (adc_advise == IN_JVM_HEAP) {
 			adc_profile_counter_inc(ADC_SWAPOUT_IN_HEAP);
 		} else if (adc_advise == IN_JVM_HEAP_FREE) {

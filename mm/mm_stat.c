@@ -118,6 +118,12 @@ void get_adc_swap_stats(struct swap_stats *stats)
 	stats->swapout_in_heap = get_adc_profile_counter(ADC_SWAPOUT_IN_HEAP);
 	stats->swapout_in_heap_free =
 		get_adc_profile_counter(ADC_SWAPOUT_IN_HEAP_FREE);
+#ifdef ADC_PROFILE_SWAP_OUT_CPUTIME
+	stats->shrink_page_list_nr_pages =
+		get_adc_profile_counter(ADC_SHRINK_PAGE_LIST_NR_PAGES);
+	stats->shrink_page_list_time_ns =
+		(unsigned long long)get_adc_profile_counter(ADC_SHRINK_PAGE_LIST_TIME_NS);
+#endif
 }
 
 __maybe_unused static const char
@@ -128,6 +134,10 @@ __maybe_unused static const char
 		[ADC_SWAPOUT_OUT_HEAP] = "swapout_out_heap",
 		[ADC_SWAPOUT_IN_HEAP] = "swapout_in_heap",
 		[ADC_SWAPOUT_IN_HEAP_FREE] = "swapout_in_heap_free",
+#ifdef ADC_PROFILE_SWAP_OUT_CPUTIME
+		[ADC_SHRINK_PAGE_LIST_NR_PAGES] = "shrink_page_list_nr_pages",
+		[ADC_SHRINK_PAGE_LIST_TIME_NS] = "shrink_page_list_time_ns",
+#endif
 	};
 
 __maybe_unused static const char *adc_jvm_heap_flag_names[NUM_JVM_HEAP_FLAG] = {
