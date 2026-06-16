@@ -959,7 +959,9 @@ static int __maybe_unused madvise_free_single_vma_profiling(struct vm_area_struc
 #ifdef PROFILE_MADV_FREE_BREAKDOWN
 	// yizhe: ADC_MADV_FREE_LRU_DRAIN Begin
 	ts_stt = ktime_get_ns();
+#ifdef MADV_FREE_ENABLE_LRU_DRAIN
 	lru_add_drain();
+#endif
 	adc_madv_breakdown_end(madv_breakdown, ADC_MADV_FREE_LRU_DRAIN, ktime_get_ns() - ts_stt);
 	// yizhe: ADC_MADV_FREE_LRU_DRAIN End
 #else

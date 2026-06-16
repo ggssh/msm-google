@@ -720,12 +720,25 @@ void __maybe_unused mark_page_lazyfree_profiling(struct page *page, uint64_t *ma
 {
 	if (PageLRU(page) && PageAnon(page) && PageSwapBacked(page) &&
 	    !PageSwapCache(page) && !PageUnevictable(page)) {
+#ifdef MADV_FREE_ENABLE_LRU_DRAIN
 		struct pagevec *pvec = &get_cpu_var(lru_lazyfree_pvecs);
 
 		get_page(page);
 		if (!pagevec_add(pvec, page) || PageCompound(page))
 			pagevec_lru_move_fn(pvec, lru_lazyfree_fn, NULL);
 		put_cpu_var(lru_lazyfree_pvecs);
+#else
+		// Do not move pages to inactive list.
+
+		ClearPageActive(page);
+		ClearPageReferenced(page);
+		/*
+		* Lazyfree pages are clean anonymous pages.  They have
+		* PG_swapbacked flag cleared, to distinguish them from normal
+		* anonymous pages
+		*/
+		ClearPageSwapBacked(page);
+#endif
 	}
 }
 
